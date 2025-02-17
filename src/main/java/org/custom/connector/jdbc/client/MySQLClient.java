@@ -3,6 +3,7 @@
 
 package org.custom.connector.jdbc.client;
 
+import com.amazonaws.appflow.custom.connector.model.ConnectorContext;
 import com.amazonaws.appflow.custom.connector.model.metadata.DescribeEntityRequest;
 import com.amazonaws.appflow.custom.connector.model.metadata.Entity;
 import com.amazonaws.appflow.custom.connector.model.metadata.FieldDataType;
@@ -13,6 +14,7 @@ import com.amazonaws.appflow.custom.connector.model.metadata.ImmutableReadOperat
 import com.amazonaws.appflow.custom.connector.model.metadata.ImmutableWriteOperationProperty;
 import com.amazonaws.appflow.custom.connector.model.metadata.ListEntitiesRequest;
 import com.amazonaws.appflow.custom.connector.model.query.QueryDataRequest;
+import com.amazonaws.appflow.custom.connector.model.query.ImmutableQueryDataRequest;
 import com.amazonaws.appflow.custom.connector.model.write.WriteDataRequest;
 import com.amazonaws.appflow.custom.connector.model.write.WriteOperationType;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -223,6 +225,10 @@ public final class MySQLClient implements JDBCClient {
 
   @Override
   public long getTotalData(final QueryDataRequest request) {
+    return getTotalData(request, true);
+  }
+
+  private long getTotalData(final QueryDataRequest request, boolean closeConnection) {
     try (Connection conn = getConnection()) {
       Statement st = conn.createStatement();
 
@@ -235,7 +241,9 @@ public final class MySQLClient implements JDBCClient {
       rs.next();
       long count = rs.getLong("cnt");
       st.close();
-      conn.close();
+      if (closeConnection) {
+        conn.close();
+      }
       return count;
     } catch (SQLException ex) {
       LOGGER.error("SQLException information");
@@ -249,6 +257,10 @@ public final class MySQLClient implements JDBCClient {
 
   @Override
   public List<String> queryData(final QueryDataRequest request) {
+    return queryData(request, true);
+  }
+
+  private List<String> queryData(final QueryDataRequest request, boolean closeConnection) {
     List<String> records = new ArrayList<String>();
 
     try (Connection conn = getConnection()) {
@@ -285,6 +297,9 @@ public final class MySQLClient implements JDBCClient {
         }
       }
       rs.close();
+      if (closeConnection) {
+        conn.close();
+      }
     } catch (SQLException ex) {
       LOGGER.error("SQLException information");
       while (ex != null) {
@@ -299,7 +314,16 @@ public final class MySQLClient implements JDBCClient {
   @Override
   public int[] writeData(final WriteDataRequest request) {
     JsonNode recordJson;
+    Map<String, String> zohoModifiedTimes;
 
+    try {
+      zohoModifiedTimes = 
+        getZohoModifiedTimes(request.entityIdentifier(), request.connectorContext());
+    } catch (Exception ex) {
+      LOGGER.error("Error msg: " + ex.getMessage());
+      throw new RuntimeException("Error");
+    }
+    
     try (Connection conn = getConnection()) {
       conn.setAutoCommit(true);
       Statement statement = conn.createStatement();
@@ -317,6 +341,14 @@ public final class MySQLClient implements JDBCClient {
         Iterator<String> iterator = recordJson.fieldNames();
         iterator.forEachRemaining(e -> keys.add(e));
 
+        LOGGER.info("Incoming record: {}", recordJson.get("zoho_record_id").asText());
+        if (isSkipRecord(recordJson, zohoModifiedTimes)) {
+          LOGGER.info("Skipping record {} from table {} as it is unchanged in Zoho since the last sync.", 
+            recordJson.get("zoho_record_id").asText(), request.entityIdentifier());
+          continue;
+        }
+        LOGGER.info("Processing record: {}", recordJson.get("zoho_record_id").asText());
+
         if (WriteOperationType.INSERT.equals(request.operation()) || WriteOperationType.UPSERT.equals(request.operation())) {
           if (WriteOperationType.UPSERT.equals(request.operation())) {
             sql = "REPLACE";
@@ -326,13 +358,46 @@ public final class MySQLClient implements JDBCClient {
 
           sql += String.format(" INTO `%s` (%s) VALUES (", request.entityIdentifier(), String.join(",", keys));
           String value;
+          JsonNode jsonValue;
 
           for (int i = 0; i < keys.size(); i++) {
-            value = StringEscapeUtils.escapeJava(getValueFromRecord(recordJson, keys.get(i)));
-            if (i > 0) {
-              sql += String.format(", \"%s\"", value);
+            jsonValue = recordJson.get(keys.get(i));
+            if (jsonValue == null || jsonValue.isNull()) {
+              if (i > 0) {
+                sql += ", NULL";
+              } else {
+                sql += "NULL"; 
+              }
+              continue;
+            }
+
+            if (jsonValue.isTextual()) {
+              value = StringEscapeUtils.escapeJava(jsonValue.asText());
+              if (i > 0) {
+                sql += String.format(", \"%s\"", value);
+              } else {
+                sql += String.format("\"%s\"", value);
+              }
+            } else if (jsonValue.isNumber()) {
+              if (i > 0) {
+                sql += String.format(", %s", jsonValue.asText());
+              } else {
+                sql += jsonValue.asText();
+              }
+            } else if (jsonValue.isBoolean()) {
+              if (i > 0) {
+                sql += String.format(", %b", jsonValue.asBoolean());
+              } else {
+                sql += String.format("%b", jsonValue.asBoolean());
+              }
             } else {
-              sql += String.format("\"%s\"", value);
+              // For other types like arrays/objects, convert to string
+              value = StringEscapeUtils.escapeJava(jsonValue.toString());
+              if (i > 0) {
+                sql += String.format(", \"%s\"", value);
+              } else {
+                sql += String.format("\"%s\"", value);
+              }
             }
           }
           sql += ")";
@@ -343,15 +408,46 @@ public final class MySQLClient implements JDBCClient {
 
           String recordIdKey = request.idFieldNames().get(0);
           String recordId = getValueFromRecord(recordJson, recordIdKey);
-          String value;
+          JsonNode jsonValue;
           sql = String.format("UPDATE `%s` SET ", request.entityIdentifier());
           for (int i = 0; i < keys.size(); i++) {
-            value = StringEscapeUtils.escapeJava(getValueFromRecord(recordJson, keys.get(i)));
+            jsonValue = recordJson.get(keys.get(i));
+            if (jsonValue == null || jsonValue.isNull()) {
+              if (i > 0) {
+                sql += String.format(", %s = NULL", keys.get(i));
+              } else {
+                sql += String.format("%s = NULL", keys.get(i));
+              }
+              continue;
+            }
 
-            if (i > 0) {
-              sql += String.format(", %s = \"%s\"", keys.get(i), value);
+            if (jsonValue.isTextual()) {
+              String value = StringEscapeUtils.escapeJava(jsonValue.asText());
+              if (i > 0) {
+                sql += String.format(", %s = \"%s\"", keys.get(i), value);
+              } else {
+                sql += String.format("%s = \"%s\"", keys.get(i), value);
+              }
+            } else if (jsonValue.isNumber()) {
+              if (i > 0) {
+                sql += String.format(", %s = %s", keys.get(i), jsonValue.asText());
+              } else {
+                sql += String.format("%s = %s", keys.get(i), jsonValue.asText());
+              }
+            } else if (jsonValue.isBoolean()) {
+              if (i > 0) {
+                sql += String.format(", %s = %b", keys.get(i), jsonValue.asBoolean());
+              } else {
+                sql += String.format("%s = %b", keys.get(i), jsonValue.asBoolean());
+              }
             } else {
-              sql += String.format("%s = \"%s\"", keys.get(i), value);
+              // For other types like arrays/objects, convert to string
+              String value = StringEscapeUtils.escapeJava(jsonValue.toString());
+              if (i > 0) {
+                sql += String.format(", %s = \"%s\"", keys.get(i), value);
+              } else {
+                sql += String.format("%s = \"%s\"", keys.get(i), value);
+              }
             }
           }
           sql += String.format(" WHERE %s = %s", recordIdKey, recordId);
@@ -380,5 +476,79 @@ public final class MySQLClient implements JDBCClient {
       return null;
     }
     return jsonRecord.get(key).textValue();
+  }
+
+  private Map<String, String> getZohoModifiedTimes(
+    String entityIdentifier, 
+    ConnectorContext connectorContext
+  ) {
+    final String ZOHO_MODIFIED_TIME = "zoho_modified_time";
+    final String ZOHO_RECORD_ID = "zoho_record_id";
+
+    Map<String, String> zohoModifiedTimes = new HashMap<>();
+    
+    long totalRecords = getTotalData(
+      ImmutableQueryDataRequest.builder()
+        .entityIdentifier(entityIdentifier)
+        .connectorContext(connectorContext)
+        .maxResults(1L)
+        .build(),
+      false
+    );
+    
+    List<String> records = queryData(ImmutableQueryDataRequest.builder()
+      .entityIdentifier(entityIdentifier)
+      .connectorContext(connectorContext)
+      .selectedFieldNames(List.of(ZOHO_RECORD_ID, ZOHO_MODIFIED_TIME))
+      .maxResults(totalRecords)
+      .build(),
+      false
+    );
+
+    try {
+      for (String record : records) {
+        JsonNode recordJson = objectMapper.readTree(record);
+        String recordId = getValueFromRecord(recordJson, ZOHO_RECORD_ID);
+        String modifiedTime = getValueFromRecord(recordJson, ZOHO_MODIFIED_TIME);
+        zohoModifiedTimes.put(recordId, modifiedTime);
+      }
+    } catch (JsonProcessingException e) {
+      LOGGER.error("Error parsing record: " + e.getMessage());
+      throw new RuntimeException("Error parsing record", e);
+    }
+
+    return zohoModifiedTimes;
+  }
+  
+  private boolean isSkipRecord(
+    final JsonNode jsonRecord, 
+    final Map<String, String> zohoModifiedTimes
+  ) {
+    final String ZOHO_MODIFIED_TIME = "zoho_modified_time";
+    final String ZOHO_RECORD_ID = "zoho_record_id";
+
+    if (!jsonRecord.has(ZOHO_MODIFIED_TIME) || !jsonRecord.has(ZOHO_RECORD_ID)) {
+      return false;
+    }
+
+    String incomingRecordModifiedTime = getValueFromRecord(jsonRecord, ZOHO_MODIFIED_TIME);
+    String incomingRecordModifiedTimeUTC = convertToUTC(incomingRecordModifiedTime);
+    String incomingRecordId = getValueFromRecord(jsonRecord, ZOHO_RECORD_ID);
+
+    String existingModifiedTime = zohoModifiedTimes.get(incomingRecordId);
+    return existingModifiedTime.equals(incomingRecordModifiedTimeUTC);
+  }
+
+  private String convertToUTC(String istTime) {
+    try {
+      java.time.format.DateTimeFormatter inputFormatter = java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+      java.time.format.DateTimeFormatter outputFormatter = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+      java.time.OffsetDateTime offsetDateTime = java.time.OffsetDateTime.parse(istTime, inputFormatter);
+      java.time.ZonedDateTime utcZoned = offsetDateTime.atZoneSameInstant(java.time.ZoneId.of("UTC"));
+      return utcZoned.format(outputFormatter);
+    } catch (Exception e) {
+      LOGGER.error("Error converting time: " + e.getMessage());
+      return istTime; // Return original time if conversion fails
+    }
   }
 }
