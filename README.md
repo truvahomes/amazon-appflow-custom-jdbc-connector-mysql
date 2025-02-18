@@ -101,3 +101,16 @@ sam delete
 See the [AWS SAM developer guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/what-is-sam.html) for an introduction to SAM specification, the SAM CLI, and serverless application concepts.
 
 Next, you can use AWS Serverless Application Repository to deploy ready to use Apps that go beyond hello world samples and learn how authors developed their applications: [AWS Serverless Application Repository main page](https://aws.amazon.com/serverless/serverlessrepo/)
+
+# Truva Specific Template and Steps
+- The `template.yml` file has been updated as per our AWS settings.
+- The JDBC Connector has additional support for Zoho Records.
+
+## Steps to deploy
+```
+mvn -DskipTests=true clean package
+```
+
+```
+sam deploy –-guided --stack-name AppFlowJDBCCustomConnector --region ap-south-1 --s3-bucket appflow-jdbc-custom-connector --capabilities CAPABILITY_IAM
+```
