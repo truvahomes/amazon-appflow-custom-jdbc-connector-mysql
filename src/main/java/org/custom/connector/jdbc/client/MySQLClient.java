@@ -527,7 +527,9 @@ public final class MySQLClient implements JDBCClient {
     final String ZOHO_MODIFIED_TIME = "zoho_modified_time";
     final String ZOHO_RECORD_ID = "zoho_record_id";
 
-    if (!jsonRecord.has(ZOHO_MODIFIED_TIME) || !jsonRecord.has(ZOHO_RECORD_ID)) {
+    if (!jsonRecord.has(ZOHO_MODIFIED_TIME) 
+      || !jsonRecord.has(ZOHO_RECORD_ID)
+      || !zohoModifiedTimes.containsKey(getValueFromRecord(jsonRecord, ZOHO_RECORD_ID))) {
       return false;
     }
 
